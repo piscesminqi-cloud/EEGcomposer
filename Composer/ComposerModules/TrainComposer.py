@@ -65,11 +65,9 @@ def validation_step(model, val_dataloader, device, guidance_scale=7.5):
             image = batch["image"].to(device, non_blocking=True)
             pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             prompt = batch["prompt"]
-            color = batch["color"].to(device, non_blocking=True)
             sketch = batch["sketch"].to(device, non_blocking=True)
             instance = batch["instance"].to(device, non_blocking=True)
             depth = batch["depth"].to(device, non_blocking=True)
-            intensity = batch["intensity"].to(device, non_blocking=True)
 
             # 获取目标图像的潜在表示
             image_latents = model.vae.encode(image).latent_dist.sample()
@@ -114,14 +112,12 @@ def validation_step(model, val_dataloader, device, guidance_scale=7.5):
             sketch_enc = encode_visual_condition(sketch)
             instance_enc = encode_visual_condition(instance)
             depth_enc = encode_visual_condition(depth)
-            intensity_enc = encode_visual_condition(intensity)
 
             # 处理视觉条件
             cond_local_conditions = model.local_condition_proj(
                 sketch=sketch_enc,
                 instance=instance_enc,
-                depth=depth_enc,
-                intensity=intensity_enc
+                depth=depth_enc
             )
 
             # 合并视觉条件
@@ -129,9 +125,6 @@ def validation_step(model, val_dataloader, device, guidance_scale=7.5):
             for cond in cond_local_conditions:
                 local_conditions += cond
 
-            # 将视觉条件与噪声潜在空间合并
-            color = color / torch.norm(color, p=2, dim=-1, keepdim=True)
-            model_input = torch.cat([noisy_latents, local_conditions, color], dim=1)
 
             # 准备条件嵌入
             encoder_hidden_states = torch.cat([clip_image_embeds, text_embeddings], dim=1)
@@ -205,8 +198,7 @@ def main():
         unlabeled_dir="data/unlabeled2017",
         feature_dir="data/feature_maps",
         caption_csv="data/image_captions.csv",
-        filenames_npy="data/filenames.npy",
-        color_dir="data/color_features",
+        filenames_npy="data/filenames.npy"
     )
 
     # 数据集分割
@@ -284,11 +276,9 @@ def main():
             image = batch["image"].to(device, non_blocking=True)
             pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             prompt = batch["prompt"]
-            color = batch["color"].to(device, non_blocking=True)
             sketch = batch["sketch"].to(device, non_blocking=True)
             instance = batch["instance"].to(device, non_blocking=True)
             depth = batch["depth"].to(device, non_blocking=True)
-            intensity = batch["intensity"].to(device, non_blocking=True)
 
             # 获取目标图像的潜在表示
             with torch.no_grad():
@@ -350,29 +340,22 @@ def main():
                 sketch_enc = encode_visual_condition(sketch)
                 instance_enc = encode_visual_condition(instance)
                 depth_enc = encode_visual_condition(depth)
-                intensity_enc = encode_visual_condition(intensity)
 
             # 处理视觉条件
             cond_local_conditions = (model.module.local_condition_proj(
                 sketch=sketch_enc,
                 instance=instance_enc,
-                depth=depth_enc,
-                intensity=intensity_enc
+                depth=depth_enc
             ) if num_gpus > 1 else model.local_condition_proj(
                 sketch=sketch_enc,
                 instance=instance_enc,
-                depth=depth_enc,
-                intensity=intensity_enc
+                depth=depth_enc
             ))
 
             # 合并视觉条件
             local_conditions = torch.zeros_like(noisy_latents)
             for cond in cond_local_conditions:
                 local_conditions += cond
-
-            # 将视觉条件与噪声潜在空间合并
-            color = color / torch.norm(color, p=2, dim=-1, keepdim=True)
-            model_input = torch.cat([noisy_latents, local_conditions, color], dim=1)
 
             # 准备条件嵌入
             encoder_hidden_states = torch.cat([clip_image_embeds, text_embeddings], dim=1)
