@@ -17,15 +17,7 @@ wget http://images.cocodataset.org/zips/unlabeled2017.zip
 unzip -d data/ unlabeled2017.zip
 ```
 
-## 1.2计算颜色直方图
-
-计算好颜色直方图后，保存到data文件夹下
-
-```shell
-python rayleigh-master/rayleigh/image2color.py
-```
-
-## 1.3获取图片对应的文字描述
+## 1.2获取图片对应的文字描述
 
 将图片对应的文字描述存储在csv文件中，保存到data文件夹下
 
@@ -33,7 +25,7 @@ python rayleigh-master/rayleigh/image2color.py
 python image2text.py
 ```
 
-## 1.4计算局部条件（草图、深度图、实例分割图、强度图）
+## 1.3计算局部条件（草图、深度图、实例分割图、强度图）
 
 首先下载对应模型的预训练权重（MiDaS、segment-anything）并复制到对应目录下，然后运行预处理脚本
 
