@@ -20,7 +20,6 @@ import torch
 from tqdm import tqdm
 from MiDaS_master.run import init_depth_model, get_depth_map
 from segment_anything_main.test import init_segmenter, get_segmentation_mask
-from Intensity import IntensityGenerator
 from pidinet_master.edge_detector import EdgeDetector
 
 
@@ -44,13 +43,12 @@ class FeatureGenerator:
         segment_ckpt = os.path.join(current_dir, "segment_anything_main/sam_vit_l_0b3195.pth")
         self.segmenter = init_segmenter(segment_ckpt)
 
-        # 初始化草图模型
+        # 初始化边缘图模型
         sketch_ckpt = os.path.join(current_dir, "pidinet_master/trained_models/table7_pidinet.pth")
         self.sketch_gen = EdgeDetector(checkpoint_path=sketch_ckpt)
         if hasattr(self.sketch_gen, 'model'):
             self.sketch_gen.model.to(self.device)
 
-        self.intensity_gen = IntensityGenerator()
 
     def __del__(self):
         """安全释放资源"""
@@ -78,8 +76,7 @@ class FeatureGenerator:
         return {
             "depth": to_3channels(get_depth_map(image_rgb, self.depth_model, self.depth_transform, self.device)),
             "segment": to_3channels(get_segmentation_mask(image_rgb, self.segmenter)),
-            "sketch": to_3channels(sketch_map),
-            "intensity": to_3channels(self.intensity_gen.get_intensity(image_rgb))
+            "sketch": to_3channels(sketch_map)
         }
 
     def process_batch(self, file_list, input_dir, output_dir):
@@ -115,7 +112,7 @@ class FeatureGenerator:
     def _save_results(self, results, img_path, input_root, output_root):
         rel_path = os.path.relpath(img_path, input_root)
         base_name = os.path.splitext(rel_path)[0]
-        for feature in ['depth', 'segment', 'sketch', 'intensity']:
+        for feature in ['depth', 'segment', 'sketch']:
             output_dir = os.path.join(output_root, feature, os.path.dirname(rel_path))
             os.makedirs(output_dir, exist_ok=True)
             cv2.imwrite(os.path.join(output_dir, base_name + f'_{feature}.jpg'), results[feature])
