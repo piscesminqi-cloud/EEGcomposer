@@ -19,15 +19,13 @@ class LocalConditionProj(nn.Module):
         self.condition_convs = nn.ModuleDict({
             'sketch': nn.Sequential(nn.Identity()),
             'instance': nn.Sequential(nn.Identity()),
-            'depth': nn.Sequential(nn.Identity()),
-            'intensity': nn.Sequential(nn.Identity())
+            'depth': nn.Sequential(nn.Identity())
         })
 
-    def dropout_conditions(self, sketch, instance, depth, intensity):
+    def dropout_conditions(self, sketch, instance, depth):
         """
-        对四个条件张量应用自定义的 Dropout 策略，并返回新的张量列表 [sketch', instance', depth', intensity']。
+        对四个条件张量应用自定义的 Dropout 策略，并返回新的张量列表 [sketch', instance', depth']。
         - sketch、instance、depth 独立以 0.5 概率丢弃
-        - intensity 以 0.7 概率丢弃
         - 0.1 概率丢弃所有条件，0.1 概率保留所有条件
         """
         device = sketch.device  # 确保在相同设备上生成随机数
@@ -38,36 +36,32 @@ class LocalConditionProj(nn.Module):
             return [
                 torch.zeros_like(sketch),
                 torch.zeros_like(instance),
-                torch.zeros_like(depth),
-                torch.zeros_like(intensity)
+                torch.zeros_like(depth)
             ]
         elif rand < 0.2:
             # 以0.1概率保留所有条件
             return [
                 sketch.clone(),
                 instance.clone(),
-                depth.clone(),
-                intensity.clone()
+                depth.clone()
             ]
         else:
             # 其他情况下独立决策是否丢弃每个条件
             drop_sketch = torch.rand(1, device=device).item() < 0.5
             drop_instance = torch.rand(1, device=device).item() < 0.5
             drop_depth = torch.rand(1, device=device).item() < 0.5
-            drop_intensity = torch.rand(1, device=device).item() < 0.7
 
             # 如果标志为 True 则置零，否则返回原张量的克隆
             new_sketch = torch.zeros_like(sketch) if drop_sketch else sketch.clone()
             new_instance = torch.zeros_like(instance) if drop_instance else instance.clone()
             new_depth = torch.zeros_like(depth) if drop_depth else depth.clone()
-            new_intensity = torch.zeros_like(intensity) if drop_intensity else intensity.clone()
 
-            return [new_sketch, new_instance, new_depth, new_intensity]
+            return [new_sketch, new_instance, new_depth]
 
-    def forward(self, sketch, instance, depth, intensity):
+    def forward(self, sketch, instance, depth):
         # 处理各条件特征
         condition_features = []
-        for name in ['sketch', 'instance', 'depth', 'intensity']:
+        for name in ['sketch', 'instance', 'depth']:
             conv = self.condition_convs[name]
             input_tensor = locals()[name]  # 获取对应名称的输入张量
             feat = conv(input_tensor)
@@ -80,7 +74,7 @@ class LocalConditionProj(nn.Module):
 class ComposerStableDiffusionPipeline(StableDiffusionPipeline):
     """
     Custom Stable Diffusion pipeline that integrates a ConditionUNet combining CLIP text features
-    with additional local conditions (color, sketch, instance, depth, intensity).
+    with additional local conditions (sketch, instance, depth).
     """
 
     def __init__(
@@ -119,6 +113,10 @@ class ComposerStableDiffusionPipeline(StableDiffusionPipeline):
         self.logger = logging.get_logger(__name__)
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.register_parameter(
+            "condition_fusion_weights",
+            nn.Parameter(torch.ones(3) * 0.33)
+        )
 
         self.clip_image_time_proj = nn.Sequential(
             nn.Linear(768, 256),
@@ -141,12 +139,10 @@ class ComposerStableDiffusionPipeline(StableDiffusionPipeline):
     @torch.no_grad()
     def __call__(
             self,
-            clip_image_embeds: np.ndarray,  # (batch, 768)
-            text_embeddings: np.ndarray,    # (batch, 768)
-            color: np.ndarray,              # (batch, 3, 64, 64)
+            clip_image_embeds: np.ndarray,
+            text_embeddings: np.ndarray,
             sketch: np.ndarray,             # (batch, 4, 64, 64)
             depth: np.ndarray,             # (batch, 4, 64, 64)
-            intensity: np.ndarray,         # (batch, 4, 64, 64)
             instance: np.ndarray,         # (batch, 4, 64, 64)
             guidance_scale: float = 7.5,
             num_inference_steps: int = 50,
@@ -156,9 +152,8 @@ class ComposerStableDiffusionPipeline(StableDiffusionPipeline):
         """
         使用预计算特征生成图像:
         - clip_image_embeds: 预计算的CLIP图像嵌入 (batch_size, 768)
-        - text_embeddings: 预计算的文本嵌入 (batch_size, 77, 768),但实际传入的是（batch_size, 768），那么现在需要填充到（batch_size, 77, 768）后面的76个768都填充0
-        - color: 颜色张量 (batch_size, 3, 64, 64)
-        - sketch, instance, depth, intensity: 视觉条件张量 (batch_size, 4, 64, 64)
+        - text_embeddings: 预计算的文本嵌入 (batch_size, 77, 768)
+        - sketch, instance, depth: 视觉条件张量 (batch_size, 4, 64, 64)
         """
         # 获取设备信息
         device = self.device
@@ -183,18 +178,11 @@ class ComposerStableDiffusionPipeline(StableDiffusionPipeline):
         clip_image_embeds = torch.from_numpy(clip_image_embeds).to(device=device, dtype=dtype)
         clip_image_embeds = torch.unsqueeze(clip_image_embeds, 1)
         text_embeddings = torch.from_numpy(text_embeddings).to(device=device, dtype=dtype)
-        color = torch.from_numpy(color).to(device=device, dtype=dtype)
         sketch = torch.from_numpy(sketch).to(device=device, dtype=dtype)
         instance = torch.from_numpy(instance).to(device=device, dtype=dtype)
         depth = torch.from_numpy(depth).to(device=device, dtype=dtype)
-        intensity = torch.from_numpy(intensity).to(device=device, dtype=dtype)
         self.clip_image_time_proj = self.clip_image_time_proj.to(device=device, dtype=dtype)
         self.clip_text_time_proj = self.clip_text_time_proj.to(device=device, dtype=dtype)
-        if text_embeddings.dim() == 2 and text_embeddings.shape[1] == 768:
-            text_embeddings_padded = torch.zeros((batch_size, 77, 768), device=text_embeddings.device, dtype=text_embeddings.dtype)
-            text_embeddings_padded[:, 0, :] = text_embeddings
-            text_embeddings = text_embeddings_padded
-
 
         # 扩散过程
         for t in self.scheduler.timesteps:
@@ -211,14 +199,12 @@ class ComposerStableDiffusionPipeline(StableDiffusionPipeline):
             # 准备CFG条件
             cond_pixel_values = torch.cat([clip_image_embeds] * 2)
             cond_prompt = torch.cat([text_embeddings] * 2)
-            cond_color = torch.cat([color] * 2)
 
             # 准备视觉条件（应用dropout）
             cond_local_conditions = self.local_condition_proj(
                 sketch=torch.cat([sketch] * 2),
                 instance=torch.cat([instance] * 2),
-                depth=torch.cat([depth] * 2),
-                intensity=torch.cat([intensity] * 2)
+                depth=torch.cat([depth] * 2)
             )
 
             # 合并全局条件
@@ -226,12 +212,13 @@ class ComposerStableDiffusionPipeline(StableDiffusionPipeline):
 
             # 合并局部条件
             local_conditions = torch.zeros_like(latent_model_input)
-            for cond in cond_local_conditions:
-                if cond is not None:
-                    local_conditions += 0.25 * cond
+            valid_conditions = [cond for cond in cond_local_conditions if cond is not None]
+            fusion_weights = torch.softmax(self.condition_fusion_weights, dim=0)
+            for i, cond in enumerate(valid_conditions):
+                local_conditions += fusion_weights[i] * cond
 
             # 将视觉条件与latents合并
-            latent_model_input = torch.cat([latent_model_input, local_conditions, cond_color], dim=1)
+            latent_model_input = torch.cat([latent_model_input, local_conditions], dim=1)
 
             # 预测噪声
             noise_pred = self.unet(
@@ -313,7 +300,7 @@ class ComposerStableDiffusionPipeline(StableDiffusionPipeline):
         if load_directory == base_unet_model_id:
             # 修改输入通道数（原始为4，现在需要11）
             with torch.no_grad():
-                custom_unet.conv_in = nn.Conv2d(4 + 4 + 3, unet_config["block_out_channels"][0], kernel_size=3,
+                custom_unet.conv_in = nn.Conv2d(4 + 4 , unet_config["block_out_channels"][0], kernel_size=3,
                                                 padding=1)
             # 复制原始权重（前4个通道）
             with torch.no_grad():
