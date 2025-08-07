@@ -34,7 +34,7 @@
   "encoder_hid_dim_type": null,
   "flip_sin_to_cos": true,
   "freq_shift": 0,
-  "in_channels": 11,
+  "in_channels": 8,
   "layers_per_block": 2,
   "mid_block_only_cross_attention": null,
   "mid_block_scale_factor": 1,
