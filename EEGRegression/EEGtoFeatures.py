@@ -732,6 +732,35 @@ class FeatureAlignmentModel:
             mse = mean_squared_error(y_test, y_pred)
             print(f"{self.feature_name} 测试 MSE: {mse:.4f}")
             return mse
+            
+    def save_intermediate_features(self, test_loader, save_dir="intermediate_features"):
+        """保存EEG中间特征"""
+        os.makedirs(save_dir, exist_ok=True)
+        self.time_attention.eval()
+        
+        all_eeg_global = []
+        all_features = []
+    
+        with torch.no_grad():
+            for eeg, feature in test_loader:
+                eeg = eeg.to(self.device)
+                feature = feature.to(self.device)
+                
+                # 提取EEG全局表示
+                eeg_global = self.extract_eeg_global(eeg)
+                
+                all_eeg_global.append(eeg_global.cpu().numpy())
+                all_features.append(feature.cpu().numpy())
+        
+        # 合并所有batch的结果
+        all_eeg_global = np.concatenate(all_eeg_global, axis=0)
+        all_features = np.concatenate(all_features, axis=0)
+        
+        # 保存为npy文件
+        np.save(os.path.join(save_dir, f"eeg_global_{self.feature_name}.npy"), all_eeg_global)
+        np.save(os.path.join(save_dir, f"true_features_{self.feature_name}.npy"), all_features)
+        
+        print(f"Saved intermediate features for {self.feature_name} to {save_dir}")
 
 
 # 加载所有被试的EEG数据
@@ -944,6 +973,9 @@ def train_and_evaluate_models():
         
         # 测试阶段评估
         test_loss = align_model.evaluate(test_loader)
+
+        # 保存中间特征
+        align_model.save_intermediate_features(test_loader, save_dir="intermediate_features")
         
         # 保存测试集预测结果
         align_model.save_test_predictions(test_loader)
