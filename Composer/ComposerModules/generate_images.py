@@ -7,7 +7,7 @@ from torchvision import transforms
 from diffusers import AutoencoderKL, DDPMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor, CLIPVisionModelWithProjection
 from ComposerUnet import ComposerUNet
-from new_composer import ComposerStableDiffusionPipeline, LocalConditionProj
+from ComposerPipeline import ComposerStableDiffusionPipeline, LocalConditionProj
 
 # 配置参数
 device = "cuda" if torch.cuda.is_available() else "cpu"
