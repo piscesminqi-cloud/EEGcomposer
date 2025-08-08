@@ -35,7 +35,6 @@ class Config:
     total_test = test_categories
     eeg_channels = 17
     eeg_timesteps = 100
-    grid_size = (64, 64)
     color_channels = 3
     batch_size = 16
     lr = 1e-4
@@ -47,9 +46,7 @@ class Config:
     feature_dims = {
         'clip_image': 768,  # CLIP图像特征维度
         'clip_text': 768,  # CLIP文本特征维度
-        'color': 3 * 64 * 64,  # 颜色特征展平后的维度
         'depth': 4 * 64 * 64,  # VAE深度图展平后的维度
-        'intensity': 4 * 64 * 64,  # VAE强度图展平后的维度
         'segmenter': 4 * 64 * 64,  # VAE分割图展平后的维度
         'sketch': 4 * 64 * 64  # VAE草图展平后的维度
     }
@@ -60,7 +57,6 @@ class Config:
 
     feature_map_types = {
         'depth': 'train_depth_images',
-        'intensity': 'train_intensity_images',
         'segmenter': 'train_segmenter_images',
         'sketch': 'train_sketch_images'
     }
@@ -264,7 +260,7 @@ class FeatureExtractors:
         # 根据特征类型重塑为原始维度
         if self.feature_name == 'color':
             target_shape = (-1, 3, 64, 64)
-        elif self.feature_name in ['depth', 'intensity', 'segmenter', 'sketch']:
+        elif self.feature_name in ['depth',  'segmenter', 'sketch']:
             target_shape = (-1, 4, 64, 64)
         else:  # clip_image 和 clip_text
             target_shape = (-1, 768)  # 保持向量形式
@@ -298,41 +294,6 @@ class EEGPreprocessor:
             channel_data = eeg_data[:, channel, :]
             normalized[:, channel, :] = self.scalers[channel].transform(channel_data)
         return normalized
-
-
-# 提取空间颜色特征
-def extract_spatial_color_features(img, grid_size=(64, 64)):
-    """提取空间颜色特征图"""
-    img_array = np.array(img)
-
-    # 创建特征图
-    feature_map = np.zeros((grid_size[0], grid_size[1], 3), dtype=np.float32)
-
-    # 计算每个网格单元的大小
-    cell_width = img.width // grid_size[1]
-    cell_height = img.height // grid_size[0]
-
-    # 处理每个网格单元
-    for row in range(grid_size[0]):
-        for col in range(grid_size[1]):
-            # 计算当前网格位置
-            left = col * cell_width
-            upper = row * cell_height
-            right = min(left + cell_width, img.width)
-            lower = min(upper + cell_height, img.height)
-
-            # 提取网格区域
-            cell = img.crop((left, upper, right, lower))
-            cell_array = np.array(cell)
-
-            # 计算该区域的平均颜色
-            if cell_array.size > 0:
-                avg_color = cell_array.mean(axis=(0, 1)) / 255.0
-                feature_map[row, col] = avg_color
-
-    # 归一化到[-1, 1]范围并调整维度顺序
-    return (feature_map * 2.0 - 1.0).transpose(2, 0, 1)  # 调整为 (C, H, W)
-
 
 # 保存特征图
 def save_features(features, mode):
@@ -447,23 +408,17 @@ def load_feature_maps(mode='train'):
             # 加载原始图像
             orig_image = Image.open(img_file).convert("RGB")
 
-            # 1. 提取颜色特征
-            color_feature = extract_spatial_color_features(orig_image, config.grid_size)
-            color_feature = torch.from_numpy(color_feature)
-            color_feature = color_feature / torch.norm(color_feature, p=2, dim=-1, keepdim=True)
-            features['color'].append(color_feature)
-
-            # 2. 提取CLIP图像特征
+            # 1. 提取CLIP图像特征
             clip_img_feature = feature_extractor.clip_encode_image(orig_image)[0]
             clip_img_feature = torch.from_numpy(clip_img_feature)
             clip_img_feature = clip_img_feature / torch.norm(clip_img_feature, p=2, dim=-1, keepdim=True)
             features['clip_image'].append(clip_img_feature)
 
-            # 3. 添加文本特征
+            # 2. 添加文本特征
             features['clip_text'].append(text_features_cache[cat_name])
 
-            # 4. 处理VAE特征图
-            for ft_type in ['depth', 'intensity', 'segmenter', 'sketch']:
+            # 3. 处理VAE特征图
+            for ft_type in ['depth',  'segmenter', 'sketch']:
                 # 构建特征图路径
                 feature_map_dir = config.feature_map_types[ft_type].replace("train", feature_prefix)
                 feature_map_path = os.path.join(
