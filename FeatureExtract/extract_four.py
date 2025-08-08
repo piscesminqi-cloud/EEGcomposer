@@ -54,8 +54,7 @@ def process_condition_images(base_dir, output_dir, conditions, splits):
     condition_dir_map = {
         "sketch": "sketch_images",
         "instance": "segmenter_images",  # 注意：目录中是segmenter，代码中是instance
-        "depth": "depth_images",
-        "intensity": "intensity_images"
+        "depth": "depth_images"
     }
     
     # 元数据存储（记录图像路径与嵌入的对应关系）
@@ -115,7 +114,7 @@ def process_condition_images(base_dir, output_dir, conditions, splits):
 if __name__ == "__main__":
     BASE_IMAGE_DIR = "data"  # 包含训练和测试目录的根目录
     OUTPUT_DIR = "condition_embeddingss"
-    CONDITIONS = ['sketch', 'instance', 'depth', 'intensity']
+    CONDITIONS = ['sketch', 'instance', 'depth']
     SPLITS = ['train', 'test']  # 注意：目录中是training/test，代码中是train/test
     
     process_condition_images(
