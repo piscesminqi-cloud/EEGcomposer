@@ -70,107 +70,6 @@ class WarmupCosineSchedule:
                 lr = param_group['initial_lr'] * (1 + np.cos(np.pi * progress)) / 2
                 param_group['lr'] = max(lr, 1e-6)
 
-
-def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
-    return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
-
-
-# 可学习的位置编码
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000, learnable: bool = False):
-        super().__init__()
-        position = torch.arange(max_len).unsqueeze(1)  # (16,1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        if learnable:
-            self.pe = nn.Parameter(pe)  # 可学习参数
-        else:
-            self.register_buffer('pe', pe)  # 固定编码
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:x.size(1)].unsqueeze(0)
-
-
-class EEGTransformer(nn.Module):
-    def __init__(self, input_dim=17, embed_dim=2048, num_patches=100, learnable_pe=True):  #2048
-        super().__init__()
-        # 分块嵌入层
-        self.patch_embed = nn.Sequential(
-            nn.Conv1d(input_dim, embed_dim, kernel_size=1, stride=1), 
-            nn.AdaptiveAvgPool1d(num_patches),
-            Rearrange('b d n -> b n d'), 
-            nn.LayerNorm(embed_dim)
-        )
-        self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-
-        # 位置编码模块
-        self.pos_encoder = PositionalEncoding(embed_dim, num_patches, learnable_pe)
-
-        # Transformer编码器
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=embed_dim, nhead=16,
-                dim_feedforward=8192, activation="gelu",
-                batch_first=True, norm_first=True
-            ), num_layers=12
-        )  # (B, 16, 1024)
-
-        # Transformer解码器
-        self.decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(
-                d_model=embed_dim, nhead=16,
-                dim_feedforward=8192, activation="gelu",
-                batch_first=True, norm_first=True
-            ), num_layers=8
-        )
-
-        # 重建头部
-        self.recon_head = nn.Sequential(
-            Rearrange('b n d -> b d n'),  # (B,16,1024) --->(B,1024,16)
-            nn.Conv1d(embed_dim, 512, kernel_size=1, stride=1),
-            Rearrange('b d n -> b n d'),
-            nn.Linear(512, 128),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 32),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(32, input_dim)
-        )
-
-    def forward(self, x: torch.Tensor, mask_ratio=0.3):
-        B, C, T = x.size()
-
-        # 分块嵌入
-        x_patch = self.patch_embed(x)  # (B, N, D)
-        N = x_patch.size(1)
-
-        # 生成随机掩码
-        mask = torch.rand(B, N, device=x.device) < mask_ratio
-
-        # 获取位置编码
-        pe = self.pos_encoder.pe[:N].unsqueeze(0)  # (1, N, D)
-        # 创建带PE的mask tokens
-        mask_tokens = self.mask_token.expand(B, N, -1) + pe
-        # 原始token添加PE
-        x_patch = x_patch + pe
-        # 替换被遮蔽的token
-        x = torch.where(mask.unsqueeze(-1), mask_tokens, x_patch)
-
-        # 编码-解码流程
-        memory = self.encoder(x)  # (B, 16, 1024)
-        tgt_mask = generate_square_subsequent_mask(N).to(x.device)
-        # 调用解码器
-        output = self.decoder(tgt=x, memory=memory, tgt_mask=tgt_mask)
-
-        # 重建输出
-        output = self.recon_head(output).permute(0, 2, 1)
-        return memory, output
-
-
-
 class EEGPreprocessor:
     def __init__(self):
         self.scalers = []  # 为每个通道创建一个独立的scaler
@@ -203,8 +102,101 @@ class EEGPreprocessor:
         return normalized
 
 
+class ATMS(nn.Module):
+    def __init__(self, num_channels=17, seq_len=100, num_subjects=10, emb_size=40):
+        super(ATMS, self).__init__()
+        # iTransformer配置
+        self.transformer = iTransformer(
+            seq_len=seq_len,
+            d_model=250,
+            enc_in=num_channels,
+            num_subjects=num_subjects
+        )
+        
+        # 时空卷积模块
+        self.spatio_temporal = nn.Sequential(
+            nn.Conv2d(1, 40, (1, 25), stride=(1, 1)),  # 时间卷积
+            nn.AvgPool2d((1, 25), (1, 5)),
+            nn.BatchNorm2d(40),
+            nn.ELU(),
+            nn.Conv2d(40, 40, (num_channels, 1), stride=(1, 1)),  # 空间卷积
+            nn.BatchNorm2d(40),
+            nn.ELU(),
+            nn.Dropout(0.5),
+            nn.Conv2d(40, emb_size, (1, 1)),
+            nn.Flatten(start_dim=2)
+        )
+        
+        # 投影头
+        self.projection = nn.Sequential(
+            nn.Linear(emb_size * seq_len, 1024),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.LayerNorm(1024)
+        )
+
+    def forward(self, x, subject_ids=None):
+        # 输入形状: [batch, channels, timesteps]
+        x = self.transformer(x, subject_ids)  # [batch, timesteps, d_model]
+        x = x.unsqueeze(1)  # [batch, 1, timesteps, channels]
+        x = self.spatio_temporal(x)  # [batch, emb_size, timesteps]
+        x = x.permute(0, 2, 1).reshape(x.size(0), -1)  # 展平 [batch, timesteps*emb_size]
+        return self.projection(x)  # [batch, 1024]
+
+# 完整EEG模型
+class EEGTransformer(nn.Module):
+    def __init__(self, input_dim=17, num_subjects=10):
+        super().__init__()
+        self.encoder = ATMS(
+            num_channels=input_dim,
+            seq_len=100,
+            num_subjects=num_subjects,
+            emb_size=40
+        )
+        
+        self.decoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
+                d_model=1024, nhead=8,
+                dim_feedforward=2048, activation="gelu",
+                batch_first=True, norm_first=True
+            ), num_layers=4
+        )
+        
+        self.recon_head = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 128),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, input_dim * 100),
+            nn.Tanh()
+        )
+        self.mask_token = nn.Parameter(torch.randn(1, 1, 1024))
+
+    def forward(self, x, mask_ratio=0.3, subject_ids=None):
+        B, C, T = x.size()
+        latent = self.encoder(x, subject_ids).unsqueeze(1)  # [B, 1, 1024]
+        
+        # 掩码处理
+        mask = torch.rand(B, 1, device=x.device) < mask_ratio
+        latent_masked = torch.where(mask, self.mask_token.expand(B, 1, -1), latent)
+        
+        # 解码重建
+        output = self.decoder(
+            tgt=latent_masked,
+            memory=latent_masked,
+            tgt_mask=generate_square_subsequent_mask(1).to(x.device)
+        ).squeeze(1)
+        
+        recon = self.recon_head(output).view(B, C, T)
+        return latent.squeeze(1), recon
+
+def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
+    return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
+
 def load_all_subject_eeg(mode='train', subject_preprocessors=None):
-    all_eeg = []
+    all_eeg_list = []
     
     # 初始化预处理器字典（如果未提供）
     if subject_preprocessors is None:
@@ -238,9 +230,16 @@ def load_all_subject_eeg(mode='train', subject_preprocessors=None):
         # 使用该被试特定的预处理器
         eeg_data = subject_preprocessors[subject_id].transform(eeg_data)
         
-        # 添加到总数据集
-        all_eeg.append(eeg_data)
-    return all_eeg,  subject_preprocessors  # 返回所有预处理器
+        # 添加到列表
+        all_eeg_list.append(eeg_data)
+    
+    # 合并EEG数据
+    all_eeg = np.concatenate(all_eeg_list, axis=0)
+    
+    # 创建subject_labels (0-9)
+    subject_labels = np.concatenate([np.full(len(eeg), sid - 1) for sid, eeg in enumerate(all_eeg_list, 1)])
+    
+    return all_eeg, subject_preprocessors, subject_labels
 
 def train_simple(resume_checkpoint=None):
     # 初始化
@@ -262,14 +261,18 @@ def train_simple(resume_checkpoint=None):
         print(f"从 epoch {start_epoch} 继续训练")
     
     # 加载数据
-    all_eeg, preprocessors = load_all_subject_eeg(mode='train')
-    train_data = np.concatenate(all_eeg, axis=0)
-    val_data, _ = load_all_subject_eeg('test', subject_preprocessors=preprocessors)
-    val_data = np.concatenate(val_data, axis=0)
+    train_eeg, preprocessors, train_subjects = load_all_subject_eeg(mode='train')
+    val_eeg, _, val_subjects = load_all_subject_eeg('test', subject_preprocessors=preprocessors)
     
     # 数据集和数据加载器
-    train_dataset = TensorDataset(torch.tensor(train_data, dtype=torch.float32))
-    val_dataset = TensorDataset(torch.tensor(val_data, dtype=torch.float32))
+    train_dataset = TensorDataset(
+        torch.tensor(train_eeg, dtype=torch.float32),
+        torch.tensor(train_subjects, dtype=torch.long)
+    )
+    val_dataset = TensorDataset(
+        torch.tensor(val_eeg, dtype=torch.float32),
+        torch.tensor(val_subjects, dtype=torch.long)
+    )
     
     train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4)
@@ -292,9 +295,11 @@ def train_simple(resume_checkpoint=None):
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', leave=False)
         
         for batch in pbar:
-            x = batch[0].to(device)
+            x, sub_ids = batch
+            x = x.to(device)
+            sub_ids = sub_ids.to(device)
             
-            _, recon = model(x, mask_ratio=0.3)
+            _, recon = model(x, mask_ratio=0.3, subject_ids=sub_ids)
             loss = criterion(recon, x)
             
             optimizer.zero_grad()
@@ -316,9 +321,11 @@ def train_simple(resume_checkpoint=None):
         val_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                x = batch[0].to(device)
+                x, sub_ids = batch
+                x = x.to(device)
+                sub_ids = sub_ids.to(device)
                 
-                _, recon = model(x, mask_ratio=0.3)
+                _, recon = model(x, mask_ratio=0.3, subject_ids=sub_ids)
                 loss = criterion(recon, x)
                 
                 val_loss += loss.item() * x.size(0)
