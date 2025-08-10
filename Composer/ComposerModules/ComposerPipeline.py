@@ -298,7 +298,6 @@ class ComposerStableDiffusionPipeline(StableDiffusionPipeline):
         custom_unet = ComposerUNet(**unet_config)
 
         if load_directory == base_unet_model_id:
-            # 修改输入通道数（原始为4，现在需要11）
             with torch.no_grad():
                 custom_unet.conv_in = nn.Conv2d(4 + 4 , unet_config["block_out_channels"][0], kernel_size=3,
                                                 padding=1)
