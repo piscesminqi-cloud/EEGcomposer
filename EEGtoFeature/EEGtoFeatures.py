@@ -65,106 +65,6 @@ class Config:
 config = Config()
 
 
-# 位置编码和EEGTransformer
-def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
-    return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
-
-
-# 可学习的位置编码
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000, learnable: bool = False):
-        super().__init__()
-        position = torch.arange(max_len).unsqueeze(1)  # (16,1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        if learnable:
-            self.pe = nn.Parameter(pe)  # 可学习参数
-        else:
-            self.register_buffer('pe', pe)  # 固定编码
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:x.size(1)].unsqueeze(0)
-
-
-class EEGTransformer(nn.Module):
-    def __init__(self, input_dim=17, embed_dim=2048, num_patches=100, learnable_pe=True):  #2048
-        super().__init__()
-        # 分块嵌入层
-        self.patch_embed = nn.Sequential(
-            nn.Conv1d(input_dim, embed_dim, kernel_size=1, stride=1), 
-            nn.AdaptiveAvgPool1d(num_patches),
-            Rearrange('b d n -> b n d'), 
-            nn.LayerNorm(embed_dim)
-        )
-        self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-
-        # 位置编码模块
-        self.pos_encoder = PositionalEncoding(embed_dim, num_patches, learnable_pe)
-
-        # Transformer编码器
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=embed_dim, nhead=16,
-                dim_feedforward=8192, activation="gelu",
-                batch_first=True, norm_first=True
-            ), num_layers=12
-        )  # (B, 16, 1024)
-
-        # Transformer解码器
-        self.decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(
-                d_model=embed_dim, nhead=16,
-                dim_feedforward=8192, activation="gelu",
-                batch_first=True, norm_first=True
-            ), num_layers=8
-        )
-
-        # 重建头部
-        self.recon_head = nn.Sequential(
-            Rearrange('b n d -> b d n'),  # (B,16,1024) --->(B,1024,16)
-            nn.Conv1d(embed_dim, 512, kernel_size=1, stride=1),
-            Rearrange('b d n -> b n d'),
-            nn.Linear(512, 128),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 32),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(32, input_dim)
-        )
-
-    def forward(self, x: torch.Tensor, mask_ratio=0.3):
-        B, C, T = x.size()
-
-        # 分块嵌入
-        x_patch = self.patch_embed(x)  # (B, N, D)
-        N = x_patch.size(1)
-
-        # 生成随机掩码
-        mask = torch.rand(B, N, device=x.device) < mask_ratio
-
-        # 获取位置编码
-        pe = self.pos_encoder.pe[:N].unsqueeze(0)  # (1, N, D)
-        # 创建带PE的mask tokens
-        mask_tokens = self.mask_token.expand(B, N, -1) + pe
-        # 原始token添加PE
-        x_patch = x_patch + pe
-        # 替换被遮蔽的token
-        x = torch.where(mask.unsqueeze(-1), mask_tokens, x_patch)
-
-        # 编码-解码流程
-        memory = self.encoder(x)  # (B, 16, 1024)
-        tgt_mask = generate_square_subsequent_mask(N).to(x.device)
-        # 调用解码器
-        output = self.decoder(tgt=x, memory=memory, tgt_mask=tgt_mask)
-
-        # 重建输出
-        output = self.recon_head(output).permute(0, 2, 1)
-        return memory, output
-
-
 # 特征提取模型
 class FeatureExtractors:
     def __init__(self):
@@ -231,45 +131,6 @@ class FeatureExtractors:
             ).to(self.device)
             outputs = self.text_encoder(**inputs)
             return outputs.last_hidden_state[:, 0, :].cpu().numpy()
-
-    def save_test_predictions(self, test_loader, save_dir="test_predictions"):
-        """保存测试集的预测结果（按原始维度）"""
-        os.makedirs(save_dir, exist_ok=True)
-
-        self.time_attention.eval()
-        if self.is_neural:
-            self.model.eval()
-
-        all_predictions = []
-
-        with torch.no_grad():
-            for eeg, _ in test_loader:
-                eeg = eeg.to(self.device)
-                eeg_global = self.extract_eeg_global(eeg)
-                if self.is_neural:
-                    predictions = self.model(eeg_global)
-                else:
-                    # 加载岭回归模型
-                    reg = joblib.load(f'ridge_{self.feature_name}_model.pkl')
-                    eeg_global_np = eeg_global.cpu().numpy()
-                    predictions = reg.predict(eeg_global_np)
-                    predictions = torch.tensor(predictions, dtype=torch.float32)
-                all_predictions.append(predictions.cpu())
-        # 合并所有batch的预测结果
-        all_predictions = torch.cat(all_predictions, dim=0).numpy()
-        # 根据特征类型重塑为原始维度
-        if self.feature_name == 'color':
-            target_shape = (-1, 3, 64, 64)
-        elif self.feature_name in ['depth',  'segmenter', 'sketch']:
-            target_shape = (-1, 4, 64, 64)
-        else:  # clip_image 和 clip_text
-            target_shape = (-1, 768)  # 保持向量形式
-        # 重塑为原始维度
-        reshaped_predictions = all_predictions.reshape(target_shape)
-        # 保存为npy文件（按顺序）
-        np.save(os.path.join(save_dir, f"{self.feature_name}_predictions.npy"), reshaped_predictions)
-        print(f"Saved test predictions for {self.feature_name} to {save_dir} (shape: {reshaped_predictions.shape})")
-
 
 # EEG预处理类
 class EEGPreprocessor:
@@ -487,37 +348,12 @@ class NeuralProjectionHead(nn.Module):
         return self.model(x)
 
 
-# 时间注意力模块
-class TimeAttention(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.GELU(),
-            nn.Linear(1024, 512),
-            nn.GELU(),
-            nn.Linear(512, 128),
-            nn.GELU(),
-            nn.Linear(128, 32),
-            nn.GELU(),
-            nn.Linear(32, 1),
-            nn.Softmax(dim=1)
-        )
-
-    def forward(self, x):
-        # x: (B, T, D)
-        attn_weights = self.attention(x)  # (B, T, 1)
-        attn_weights = attn_weights.permute(0, 2, 1)  # (B, 1, T)
-        return torch.bmm(attn_weights, x).squeeze(1)  # (B, D)
-
-
 # 特征对齐模型
 class FeatureAlignmentModel:
     def __init__(self, feature_name, eeg_encoder, device):
         self.feature_name = feature_name
         self.eeg_encoder = eeg_encoder
         self.device = device
-        self.time_attention = TimeAttention(2048).to(device)
 
         # 冻结EEG编码器
         for param in self.eeg_encoder.parameters():
@@ -527,30 +363,27 @@ class FeatureAlignmentModel:
         if feature_name in ['clip_image', 'clip_text']:
             # 神经网络模型
             output_dim = config.feature_dims[feature_name]
-            self.model = NeuralProjectionHead(2048, output_dim).to(device)
+            self.model = NeuralProjectionHead(1024, output_dim).to(device)
             self.is_neural = True
         else:
             # 岭回归模型
             self.model = None
             self.is_neural = False
 
-    def extract_eeg_global(self, eeg):
+    def extract_eeg_global(self, eeg, sub_ids):
         # 获取EEG潜在表示
         with torch.no_grad():
-            eeg_latent, _ = self.eeg_encoder(eeg, mask_ratio=0.0)  # (B, T, D)
-
-        # 应用时间注意力
-        eeg_global = self.time_attention(eeg_latent)  # (B, D)
+            eeg_latent, _ = self.eeg_encoder(eeg, mask_ratio=0.0, subject_ids=sub_ids)  # (B, 1024)
 
         # 对于VAE特征，应用Tanh激活
         if not self.is_neural:
-            eeg_global = torch.tanh(eeg_global)
+            eeg_latent = torch.tanh(eeg_latent)
 
-        return eeg_global
+        return eeg_latent
 
     def train_neural(self, train_loader, val_loader):
         optimizer = torch.optim.AdamW(
-            list(self.time_attention.parameters()) + list(self.model.parameters()),
+            list(self.model.parameters()),
             lr=config.lr, weight_decay=0.01
         )
 
@@ -562,7 +395,6 @@ class FeatureAlignmentModel:
         epoch_pbar = tqdm(range(config.epochs), desc=f"训练 {self.feature_name}", unit="epoch")
 
         for epoch in epoch_pbar:
-            self.time_attention.train()
             self.model.train()
             total_train_loss = 0.0
 
@@ -570,12 +402,13 @@ class FeatureAlignmentModel:
             batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.epochs}", unit="batch", leave=False)
 
             # 训练阶段
-            for eeg, feature in batch_pbar:
+            for eeg, feature, sub_ids in batch_pbar:
                 eeg = eeg.to(self.device)
                 feature = feature.to(self.device)
+                sub_ids = sub_ids.to(self.device)
 
                 # 提取EEG全局表示
-                eeg_global = self.extract_eeg_global(eeg)
+                eeg_global = self.extract_eeg_global(eeg, sub_ids)
 
                 # 前向传播
                 projection = self.model(eeg_global)
@@ -605,7 +438,6 @@ class FeatureAlignmentModel:
                 best_val_loss = val_loss
                 no_improve = 0
                 torch.save({
-                    'time_attention': self.time_attention.state_dict(),
                     'model': self.model.state_dict()
                 }, f'best_{self.feature_name}_model.pth')
                 tqdm.write(f"保存最佳模型 {self.feature_name} (epoch {epoch + 1}, val_loss={val_loss:.4f})")
@@ -655,18 +487,18 @@ class FeatureAlignmentModel:
         print(f"保存岭回归模型 {self.feature_name}")
 
     def validate(self, val_loader):
-        self.time_attention.eval()
         if self.is_neural:
             self.model.eval()
 
         total_loss = 0.0
 
         with torch.no_grad():
-            for eeg, feature in val_loader:
+            for eeg, feature, sub_ids in val_loader:
                 eeg = eeg.to(self.device)
                 feature = feature.to(self.device)
+                sub_ids = sub_ids.to(self.device)
 
-                eeg_global = self.extract_eeg_global(eeg)
+                eeg_global = self.extract_eeg_global(eeg, sub_ids)
 
                 if self.is_neural:
                     projection = self.model(eeg_global)
@@ -680,7 +512,6 @@ class FeatureAlignmentModel:
         return total_loss / len(val_loader) if self.is_neural else 0.0
 
     def evaluate(self, test_loader):
-        self.time_attention.eval()
         if self.is_neural:
             self.model.eval()
 
@@ -689,11 +520,12 @@ class FeatureAlignmentModel:
             test_pbar = tqdm(test_loader, desc=f"测试 {self.feature_name}", unit="batch")
 
             with torch.no_grad():
-                for eeg, feature in test_pbar:
+                for eeg, feature, sub_ids in test_pbar:
                     eeg = eeg.to(self.device)
                     feature = feature.to(self.device)
+                    sub_ids = sub_ids.to(self.device)
 
-                    eeg_global = self.extract_eeg_global(eeg)
+                    eeg_global = self.extract_eeg_global(eeg, sub_ids)
                     projection = self.model(eeg_global)
 
                     cos_sim = F.cosine_similarity(projection, feature, dim=-1)
@@ -715,8 +547,8 @@ class FeatureAlignmentModel:
 
             # 添加进度条
             eeg_pbar = tqdm(test_loader, desc=f"提取EEG特征 {self.feature_name}", unit="batch")
-            for eeg, feature in eeg_pbar:
-                eeg_global = self.extract_eeg_global(eeg.to(self.device)).cpu().numpy()
+            for eeg, feature, sub_ids in eeg_pbar:
+                eeg_global = self.extract_eeg_global(eeg.to(self.device), sub_ids.to(self.device)).cpu().numpy()
                 X_test.append(eeg_global)
                 y_test.append(feature.numpy())
 
@@ -736,18 +568,18 @@ class FeatureAlignmentModel:
     def save_intermediate_features(self, test_loader, save_dir="intermediate_features"):
         """保存EEG中间特征"""
         os.makedirs(save_dir, exist_ok=True)
-        self.time_attention.eval()
         
         all_eeg_global = []
         all_features = []
     
         with torch.no_grad():
-            for eeg, feature in test_loader:
+            for eeg, feature, sub_ids in test_loader:
                 eeg = eeg.to(self.device)
                 feature = feature.to(self.device)
+                sub_ids = sub_ids.to(self.device)
                 
                 # 提取EEG全局表示
-                eeg_global = self.extract_eeg_global(eeg)
+                eeg_global = self.extract_eeg_global(eeg, sub_ids)
                 
                 all_eeg_global.append(eeg_global.cpu().numpy())
                 all_features.append(feature.cpu().numpy())
@@ -762,10 +594,48 @@ class FeatureAlignmentModel:
         
         print(f"Saved intermediate features for {self.feature_name} to {save_dir}")
 
+    def save_test_predictions(self, test_loader, save_dir="test_predictions"):
+        """保存测试集的预测结果（按原始维度）"""
+        os.makedirs(save_dir, exist_ok=True)
+
+        if self.is_neural:
+            self.model.eval()
+
+        all_predictions = []
+
+        with torch.no_grad():
+            for eeg, _, sub_ids in test_loader:
+                eeg = eeg.to(self.device)
+                sub_ids = sub_ids.to(self.device)
+                eeg_global = self.extract_eeg_global(eeg, sub_ids)
+                if self.is_neural:
+                    predictions = self.model(eeg_global)
+                else:
+                    # 加载岭回归模型
+                    reg = joblib.load(f'ridge_{self.feature_name}_model.pkl')
+                    eeg_global_np = eeg_global.cpu().numpy()
+                    predictions = reg.predict(eeg_global_np)
+                    predictions = torch.tensor(predictions, dtype=torch.float32)
+                all_predictions.append(predictions.cpu())
+        # 合并所有batch的预测结果
+        all_predictions = torch.cat(all_predictions, dim=0).numpy()
+        # 根据特征类型重塑为原始维度
+        if self.feature_name == 'color':
+            target_shape = (-1, 3, 64, 64)
+        elif self.feature_name in ['depth',  'segmenter', 'sketch']:
+            target_shape = (-1, 4, 64, 64)
+        else:  # clip_image 和 clip_text
+            target_shape = (-1, 768)  # 保持向量形式
+        # 重塑为原始维度
+        reshaped_predictions = all_predictions.reshape(target_shape)
+        # 保存为npy文件（按顺序）
+        np.save(os.path.join(save_dir, f"{self.feature_name}_predictions.npy"), reshaped_predictions)
+        print(f"Saved test predictions for {self.feature_name} to {save_dir} (shape: {reshaped_predictions.shape})")
+
 
 # 加载所有被试的EEG数据
 def load_all_subject_eeg(mode='train', subject_preprocessors=None):
-    all_eeg = []
+    all_eeg_list = []
     all_features = {ft: [] for ft in config.feature_dims}
 
     if subject_preprocessors is None:
@@ -805,18 +675,21 @@ def load_all_subject_eeg(mode='train', subject_preprocessors=None):
         eeg_data = subject_preprocessors[subject_id].transform(eeg_data)
 
         # 添加到总数据集
-        all_eeg.append(eeg_data)
+        all_eeg_list.append(eeg_data)
 
         # 添加特征图（每个被试的特征图相同）
         for ft in features:
             all_features[ft].append(features[ft])
 
     # 合并所有被试数据
-    all_eeg = np.concatenate(all_eeg, axis=0) if all_eeg else np.zeros((0, 17, 100))
+    all_eeg = np.concatenate(all_eeg_list, axis=0) if all_eeg_list else np.zeros((0, 17, 100))
     for ft in all_features:
         # 沿第一个维度拼接
         all_features[ft] = np.concatenate(all_features[ft], axis=0) if all_features[ft] else np.zeros(
             (0, config.feature_dims[ft]))
+
+    # 创建subject_labels (0-9)
+    subject_labels = np.concatenate([np.full(len(eeg), sid - 1) for sid, eeg in enumerate(all_eeg_list, 1)])
 
     print(f"Combined EEG data shape: {all_eeg.shape}")
     print("Combined feature data shapes:")
@@ -824,9 +697,9 @@ def load_all_subject_eeg(mode='train', subject_preprocessors=None):
         print(f"  {ft}: {arr.shape}")
 
     if mode == 'train':
-        return all_eeg, all_features, subject_preprocessors
+        return all_eeg, all_features, subject_preprocessors, subject_labels
     else:
-        return all_eeg, all_features
+        return all_eeg, all_features, subject_labels
 
 
 # 主训练和评估函数
@@ -837,9 +710,7 @@ def train_and_evaluate_models():
     try:
         eeg_model = EEGTransformer(
             input_dim=17,
-            embed_dim=2048,
-            num_patches=100,
-            learnable_pe=True
+            num_subjects=10
         ).to(device)
         
         checkpoint = torch.load('checkpoints/model_5.pth', map_location=device)
@@ -885,7 +756,7 @@ def train_and_evaluate_models():
         test_input = torch.randn(1, 17, 100).to(device)
         try:
             with torch.no_grad():
-                memory, output = eeg_model(test_input)
+                memory, output = eeg_model(test_input, subject_ids=torch.tensor([0]).to(device))
             print(f"测试通过! 输出形状: memory={memory.shape}, output={output.shape}")
         except Exception as e:
             print(f"前向传播失败: {str(e)}")
@@ -897,16 +768,14 @@ def train_and_evaluate_models():
         print("使用随机初始化的模型")
         eeg_model = EEGTransformer(
             input_dim=17,
-            embed_dim=2048,
-            num_patches=100,
-            learnable_pe=True
+            num_subjects=10
         ).to(device)
     
     eeg_model.eval()
     
     # 加载训练数据和测试数据（严格区分）
-    train_eeg, train_features, subject_preprocessors = load_all_subject_eeg(mode='train')
-    test_eeg, test_features = load_all_subject_eeg(mode='test', subject_preprocessors=subject_preprocessors)
+    train_eeg, train_features, subject_preprocessors, train_subjects = load_all_subject_eeg(mode='train')
+    test_eeg, test_features, test_subjects = load_all_subject_eeg(mode='test', subject_preprocessors=subject_preprocessors)
     
     # 准备特征处理函数
     def prepare_feature_data(feature_data, feature_name):
@@ -930,17 +799,19 @@ def train_and_evaluate_models():
         # 转换为Tensor
         train_eeg_tensor = torch.tensor(train_eeg, dtype=torch.float32)
         train_feature_tensor = torch.tensor(train_feature, dtype=torch.float32)
+        train_subject_tensor = torch.tensor(train_subjects, dtype=torch.long)
         test_eeg_tensor = torch.tensor(test_eeg, dtype=torch.float32)
         test_feature_tensor = torch.tensor(test_feature, dtype=torch.float32)
+        test_subject_tensor = torch.tensor(test_subjects, dtype=torch.long)
         
         # 创建对齐模型
         align_model = FeatureAlignmentModel(feature_name, eeg_model, device)
         
         # 定义数据加载器
-        train_dataset = TensorDataset(train_eeg_tensor, train_feature_tensor)
+        train_dataset = TensorDataset(train_eeg_tensor, train_feature_tensor, train_subject_tensor)
         train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
         
-        test_dataset = TensorDataset(test_eeg_tensor, test_feature_tensor)
+        test_dataset = TensorDataset(test_eeg_tensor, test_feature_tensor, test_subject_tensor)
         test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
         
         # 训练阶段
@@ -952,8 +823,8 @@ def train_and_evaluate_models():
                 eeg_global_list = []
                 # 添加进度条
                 extract_pbar = tqdm(train_loader, desc=f"提取EEG特征 {feature_name}", unit="batch")
-                for eeg, _ in extract_pbar:
-                    eeg_global = align_model.extract_eeg_global(eeg.to(device))
+                for eeg, _, sub_ids in extract_pbar:
+                    eeg_global = align_model.extract_eeg_global(eeg.to(device), sub_ids.to(device))
                     eeg_global_list.append(eeg_global.cpu())
                 X_train = torch.cat(eeg_global_list, dim=0)
                 y_train = train_feature_tensor
@@ -962,8 +833,8 @@ def train_and_evaluate_models():
             with torch.no_grad():
                 eeg_global_list = []
                 extract_pbar = tqdm(test_loader, desc=f"提取EEG特征 {feature_name}", unit="batch")
-                for eeg, _ in extract_pbar:
-                    eeg_global = align_model.extract_eeg_global(eeg.to(device))
+                for eeg, _, sub_ids in extract_pbar:
+                    eeg_global = align_model.extract_eeg_global(eeg.to(device), sub_ids.to(device))
                     eeg_global_list.append(eeg_global.cpu())
                 X_test = torch.cat(eeg_global_list, dim=0)
                 y_test = test_feature_tensor
