@@ -166,22 +166,21 @@ class EEGTransformer(nn.Module):
         """
         super().__init__()
 
-        # 1. TokenEmbedding: 输出 (B, d_model, T)
+        # TokenEmbedding: 输出 (B, d_model, T)
         self.token_embed = TokenEmbedding(input_dim, embed_dim)
 
-        # 2. patch->sequence (保持时间步 T 不变)
         self.patch_embed_ln = nn.Sequential(
             Rearrange('b d n -> b n d'),  # after token_embed we'll pool? but here token_embed returns (B,d_model,T) -> Rearrange gives (B,T,d_model)
             nn.LayerNorm(embed_dim)
         )
 
-        # 3. subject embedding
+        # subject embedding
         self.subject_embedding = SubjectEmbedding(num_subjects, embed_dim)
 
-        # 4. positional encoding
+        # positional encoding
         self.pos_encoder = PositionalEmbedding(embed_dim, max_len=max_len)
 
-        # 5. encoder & decoder
+        # encoder & decoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=nhead,
@@ -491,6 +490,5 @@ def train_simple(resume_checkpoint=None, data_root="data", subject_count=10):
 
 
 if __name__ == "__main__":
-    # 指定要恢复的检查点路径（如果不需要恢复可以设为 None）
     checkpoint_path = "checkpoints/model_5.pth" if os.path.exists("checkpoints/model_5.pth") else None
     train_simple(resume_checkpoint=checkpoint_path, data_root="data", subject_count=10)
