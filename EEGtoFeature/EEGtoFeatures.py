@@ -45,7 +45,7 @@ class Config:
 
     feature_dims = {
         'clip_image': 768,  # CLIP图像特征维度
-        'clip_text': 768,  # CLIP文本特征维度
+        'clip_text': 77 * 768,  # CLIP文本特征维度 (77 tokens * 768 dim)
         'depth': 4 * 64 * 64,  # VAE深度图展平后的维度
         'segmenter': 4 * 64 * 64,  # VAE分割图展平后的维度
         'sketch': 4 * 64 * 64  # VAE草图展平后的维度
@@ -54,6 +54,9 @@ class Config:
     train_image_dir = "data/training_images"
     test_image_dir = "data/test_images"
     eeg_base = "data"
+    
+    train_text_feature_path = "features_train/all_text_features.npy"
+    test_text_feature_path = "features_test/all_text_features.npy"
 
     feature_map_types = {
         'depth': 'train_depth_images',
@@ -120,7 +123,7 @@ class FeatureExtractors:
 
     # CLIP文本编码
     def clip_encode_text(self, text):
-        """使用CLIP编码文本"""
+        """使用CLIP编码文本 - 返回完整序列 (77, 768)"""
         with torch.no_grad():
             inputs = self.tokenizer(
                 text,
@@ -130,7 +133,9 @@ class FeatureExtractors:
                 return_tensors="pt"
             ).to(self.device)
             outputs = self.text_encoder(**inputs)
-            return outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            # 返回完整的隐藏状态序列 (batch_size, 77, 768)
+            return outputs.last_hidden_state.cpu().numpy()
+
 
 # EEG预处理类
 class EEGPreprocessor:
@@ -223,11 +228,15 @@ def load_feature_maps(mode='train'):
         num_categories = config.train_categories
         images_per_cat = config.images_per_category
         feature_prefix = "train"
+        # 加载预提取的文本特征
+        text_features_all = np.load(config.train_text_feature_path)  # (n_samples, 77, 768)
     else:  # test
         image_dir = config.test_image_dir
         num_categories = config.test_categories
         images_per_cat = 1
         feature_prefix = "test"
+        # 加载预提取的文本特征
+        text_features_all = np.load(config.test_text_feature_path)  # (n_samples, 77, 768)
 
     print(f"\n{'=' * 50}")
     print(f"开始加载 {mode} 数据集的特征图")
@@ -237,23 +246,15 @@ def load_feature_maps(mode='train'):
     category_dirs = sorted(glob.glob(os.path.join(image_dir, "*")))
     print(f"找到 {len(category_dirs)} 个类别目录")
 
-    # 用于存储文本特征的字典（按类别存储）
-    text_features_cache = {}
-
     # 添加进度条
     pbar = tqdm(category_dirs, desc=f"处理 {mode} 类别", unit="category")
+    text_feature_idx = 0  # 用于跟踪文本特征索引
+    
     for cat_dir in pbar:
         # 从目录名中提取类别名称
         dir_name = os.path.basename(cat_dir)
         cat_name = dir_name.split('_', 1)[1] if '_' in dir_name else dir_name
         pbar.set_postfix({"当前类别": cat_name[:20] + "..." if len(cat_name) > 20 else cat_name})
-
-        # 处理文本特征（每个类别一个）
-        if cat_name not in text_features_cache:
-            text_feature = feature_extractor.clip_encode_text(cat_name)[0]
-            text_feature = torch.from_numpy(text_feature)
-            text_feature = text_feature / torch.norm(text_feature, p=2, dim=-1, keepdim=True)
-            text_features_cache[cat_name] = text_feature
 
         def natural_sort_key(s):
             return [int(text) if text.isdigit() else text.lower()
@@ -275,11 +276,16 @@ def load_feature_maps(mode='train'):
             clip_img_feature = clip_img_feature / torch.norm(clip_img_feature, p=2, dim=-1, keepdim=True)
             features['clip_image'].append(clip_img_feature)
 
-            # 2. 添加文本特征
-            features['clip_text'].append(text_features_cache[cat_name])
+            # 2. 添加预提取的文本特征 (77, 768)
+            text_feature = text_features_all[text_feature_idx]  # 获取当前图像的文本特征
+            text_feature = torch.from_numpy(text_feature)
+            # 对每个token向量进行归一化
+            text_feature = text_feature / torch.norm(text_feature, p=2, dim=-1, keepdim=True)
+            features['clip_text'].append(text_feature)
+            text_feature_idx += 1  # 移动到下一个文本特征
 
             # 3. 处理VAE特征图
-            for ft_type in ['depth',  'segmenter', 'sketch']:
+            for ft_type in ['depth', 'segmenter', 'sketch']:
                 # 构建特征图路径
                 feature_map_dir = config.feature_map_types[ft_type].replace("train", feature_prefix)
                 feature_map_path = os.path.join(
@@ -314,7 +320,11 @@ def load_feature_maps(mode='train'):
     # 转换为数组
     print("\n特征提取完成，正在转换为数组...")
     for ft in features:
-        features[ft] = np.array(features[ft])
+        # 对于文本特征，需要展平为 (batch_size, 77*768)
+        if ft == 'clip_text':
+            features[ft] = torch.stack(features[ft]).view(len(features[ft]), -1).numpy()
+        else:
+            features[ft] = np.array(features[ft])
         print(f"  {ft} 特征形状: {features[ft].shape}")
 
     # 保存提取的特征
@@ -622,9 +632,11 @@ class FeatureAlignmentModel:
         # 根据特征类型重塑为原始维度
         if self.feature_name == 'color':
             target_shape = (-1, 3, 64, 64)
-        elif self.feature_name in ['depth',  'segmenter', 'sketch']:
+        elif self.feature_name in ['depth', 'segmenter', 'sketch']:
             target_shape = (-1, 4, 64, 64)
-        else:  # clip_image 和 clip_text
+        elif self.feature_name == 'clip_text':
+            target_shape = (-1, 77, 768)  # 文本特征的特殊形状
+        else:  # clip_image
             target_shape = (-1, 768)  # 保持向量形式
         # 重塑为原始维度
         reshaped_predictions = all_predictions.reshape(target_shape)
