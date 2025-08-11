@@ -158,11 +158,10 @@ class SubjectEmbedding(nn.Module):
 
 
 class EEGTransformer(nn.Module):
-    def __init__(self, input_dim=17, embed_dim=512, num_layers_enc=6, num_layers_dec=4, nhead=8, num_subjects=10, max_len=5000):
+    def __init__(self, input_dim=17, embed_dim=2048, num_layers_enc=6, num_layers_dec=4, nhead=8, num_subjects=10, max_len=5000):
         """
         input_dim: 原始通道数 (C)
         embed_dim: Transformer 的 d_model
-        我把 embed_dim 和层数降低到更常见的数值，避免显存爆炸（你可以按需要调回 2048 / 12）
         """
         super().__init__()
 
@@ -248,7 +247,7 @@ class EEGTransformer(nn.Module):
 
         seq_len = x_seq.size(1)
 
-        # mask处理：随机掩码（对 entire sequence 的每个token），但我们通常不掩 subject token
+        # mask处理：随机掩码（对 entire sequence 的每个token）
         rand = torch.rand((B, seq_len), device=x.device)
         if has_subject:
             # 不掩 subject token（索引0）
@@ -375,7 +374,7 @@ def save_checkpoint(model, optimizer, epoch, loss, path_dir="checkpoints"):
 
 def train_simple(resume_checkpoint=None, data_root="data", subject_count=10):
     # 初始化 model & device
-    model = EEGTransformer(input_dim=17, embed_dim=512, num_layers_enc=6, num_layers_dec=4, nhead=8, num_subjects=subject_count).to(device)
+    model = EEGTransformer(input_dim=17, embed_dim=2048, num_layers_enc=6, num_layers_dec=4, nhead=8, num_subjects=subject_count).to(device)
     print('模型初始化完成！')
 
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=1e-4)
