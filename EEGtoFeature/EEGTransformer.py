@@ -104,6 +104,39 @@ class EEGPreprocessor:
         
         return normalized
 
+class iTransformer(nn.Module):
+    def __init__(self, configs, joint_train=False,  num_subjects=10):
+        super(iTransformer, self).__init__()
+        self.task_name = configs.task_name
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
+        self.output_attention = configs.output_attention
+        # Embedding
+        self.enc_embedding = DataEmbedding(configs.seq_len, configs.d_model, configs.embed, configs.freq, configs.dropout, joint_train=False, num_subjects=num_subjects)
+        # Encoder
+        self.encoder = Encoder(
+            [
+                EncoderLayer(
+                    AttentionLayer(
+                        FullAttention(False, configs.factor, attention_dropout=configs.dropout, output_attention=configs.output_attention),
+                        configs.d_model, configs.n_heads
+                    ),
+                    configs.d_model,
+                    configs.d_ff,
+                    dropout=configs.dropout,
+                    activation=configs.activation
+                ) for l in range(configs.e_layers)
+            ],
+            norm_layer=torch.nn.LayerNorm(configs.d_model)
+        )
+
+    def forward(self, x_enc, x_mark_enc, subject_ids=None):
+        # Embedding
+        enc_out = self.enc_embedding(x_enc, x_mark_enc, subject_ids)
+        enc_out, attns = self.encoder(enc_out, attn_mask=None)
+        enc_out = enc_out[:, :63, :]      
+        # print("enc_out", enc_out.shape)
+        return enc_out
 
 class ATMS(nn.Module):
     def __init__(self, num_channels=17, seq_len=100, num_subjects=10, emb_size=40):
